@@ -665,6 +665,53 @@ test('should not reap session of a client without the event stream', async ({ se
   expect(formatLog(stderr())['delete http session']).toBeUndefined();
 });
 
+async function connectPostOnlyClientWithRoots(url: URL) {
+  // Advertises roots but never opens the GET event stream, so a server-initiated
+  // roots/list request cannot be delivered to it.
+  const endpoint = new URL('/mcp', url);
+  let lastId = 0;
+  let sessionId: string | undefined;
+  const post = async (body: object) => {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'accept': 'application/json, text/event-stream',
+        ...(sessionId ? { 'mcp-session-id': sessionId } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    sessionId ??= response.headers.get('mcp-session-id') ?? undefined;
+    return { status: response.status, text: await response.text() };
+  };
+  await post({ jsonrpc: '2.0', id: ++lastId, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: { roots: {} }, clientInfo: { name: 'post-only-roots', version: '1.0.0' } } });
+  await post({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  return {
+    callTool: (name: string, args: object) => post({ jsonrpc: '2.0', id: ++lastId, method: 'tools/call', params: { name, arguments: args } }),
+  };
+}
+
+test('should not hang a POST-only client that advertises roots', { annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright-mcp/issues/1798' } }, async ({ serverEndpoint, server }) => {
+  const { url } = await serverEndpoint();
+  const client = await connectPostOnlyClientWithRoots(url);
+
+  const navigate = await client.callTool('browser_navigate', { url: server.HELLO_WORLD });
+  expect(navigate.text).toContain(`Page URL: ${server.HELLO_WORLD}`);
+});
+
+test('should wait for the event stream once per session', { annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright-mcp/issues/1798' } }, async ({ serverEndpoint, server }) => {
+  const { url } = await serverEndpoint();
+  const client = await connectPostOnlyClientWithRoots(url);
+  await client.callTool('browser_navigate', { url: server.HELLO_WORLD });
+  await client.callTool('browser_close', {});
+
+  // The new backend must not wait for the event stream again.
+  const start = Date.now();
+  const navigate = await client.callTool('browser_navigate', { url: server.HELLO_WORLD });
+  expect(navigate.text).toContain(`Page URL: ${server.HELLO_WORLD}`);
+  expect(Date.now() - start).toBeLessThan(4000);
+});
+
 test('should not run heartbeat when timeout is non-positive', async ({ serverEndpoint, server }) => {
   const { url, stderr } = await serverEndpoint({ env: { PLAYWRIGHT_MCP_PING_TIMEOUT_MS: '0' } });
 

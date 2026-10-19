@@ -70,6 +70,16 @@ export function createServer(name: string, version: string, factory: ServerBacke
   let backendPromise: Promise<ServerBackend> | undefined;
   let heartbeatStarted = false;
 
+  // Wait for the event stream once per session: every backend after browser_close reuses the outcome.
+  let transportReady = false;
+  void transportInitialized.then(() => transportReady = true);
+  let transportWait: Promise<void> | undefined;
+  const waitForTransport = async () => {
+    transportWait ??= Promise.race([transportInitialized, new Promise<void>(f => setTimeout(f, 5000))]);
+    await transportWait;
+    return transportReady;
+  };
+
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     serverDebug('listTools');
     const tools = factory.toolSchemas.map(s => toMcpTool(s));
@@ -86,7 +96,7 @@ export function createServer(name: string, version: string, factory: ServerBacke
 
     try {
       if (!backendPromise) {
-        const promise = initializeServer(server, factory, transportInitialized).then(backend => {
+        const promise = initializeServer(server, factory, waitForTransport).then(backend => {
           backend.on?.('dynamictoolschange', () => {
             if (backendPromise === promise)
               void server.sendToolListChanged().catch(serverDebug);
@@ -124,16 +134,18 @@ export function createServer(name: string, version: string, factory: ServerBacke
   return server;
 }
 
-const initializeServer = async (server: ServerType, factory: ServerBackendFactory, transportInitialized: Promise<void>): Promise<ServerBackend> => {
+const initializeServer = async (server: ServerType, factory: ServerBackendFactory, waitForTransport: () => Promise<boolean>): Promise<ServerBackend> => {
   const capabilities = server.getClientCapabilities();
   let clientRoots: Root[] = [];
   if (capabilities?.roots) {
-    await Promise.race([transportInitialized, new Promise<void>(f => setTimeout(f, 5000))]);
-    const { roots } = await server.listRoots().catch(e => {
-      serverDebug(e);
-      return { roots: [] };
-    });
-    clientRoots = roots;
+    // Without the event stream, roots/list cannot reach the client and would only end on the request timeout.
+    if (await waitForTransport()) {
+      const { roots } = await server.listRoots().catch(e => {
+        serverDebug(e);
+        return { roots: [] };
+      });
+      clientRoots = roots;
+    }
   }
 
   const clientInfo: ClientInfo = {
